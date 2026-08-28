@@ -1508,11 +1508,16 @@ function CameraRig({
   live,
   approach,
   controls,
+  flyTo,
+  onArrive,
 }: {
   focusIds: string[] | null;
   live: LiveMap;
   approach: number;
   controls: React.RefObject<any>;
+  /** one-shot camera transition to a point on the globe */
+  flyTo: { point: THREE.Vector3; distance: number } | null;
+  onArrive: () => void;
 }) {
   const desired = useRef(new THREE.Vector3());
   const target = useRef(new THREE.Vector3());
@@ -1520,6 +1525,17 @@ function CameraRig({
     const c = controls.current;
     if (!c) return;
     const k = 1 - Math.exp(-2.6 * d);
+
+    if (flyTo) {
+      const t = flyTo.point;
+      c.target.lerp(t, k * 0.9);
+      desired.current.copy(t).setLength(flyTo.distance);
+      camera.position.lerp(desired.current, k * 0.8);
+      c.update();
+      if (camera.position.distanceTo(desired.current) < 0.035) onArrive();
+      return;
+    }
+
     if (focusIds && focusIds.length) {
       target.current.set(0, 0, 0);
       let n = 0;
@@ -1534,7 +1550,7 @@ function CameraRig({
       target.current.multiplyScalar(1 / n);
       const t = target.current;
       c.target.lerp(t, k);
-      const dist = Math.max(1.42, t.length() + approach);
+      const dist = Math.max(1.5, t.length() + approach);
       desired.current.copy(t).setLength(dist);
       camera.position.lerp(desired.current, k * 0.95);
     } else {
