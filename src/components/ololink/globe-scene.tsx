@@ -1263,6 +1263,210 @@ function AffectedFootprint({ cell, color }: { cell: WeatherCell; color: string }
 }
 
 
+/* ------------------------------------------------ global-view abstractions */
+
+/** Operational region badge shown when the Earth is viewed from far away. */
+function RegionMarker({
+  region,
+  counts,
+  onFocus,
+}: {
+  region: RegionDef;
+  counts: { assets: number; ground: number };
+  onFocus: (r: RegionDef) => void;
+}) {
+  const [hover, setHover] = useState(false);
+  const position = useMemo(
+    () => new THREE.Vector3(...geoOnShell(region.lat, region.lon, 1.004)),
+    [region]
+  );
+  const quat = useMemo(() => {
+    const q = new THREE.Quaternion();
+    q.setFromUnitVectors(new THREE.Vector3(0, 0, 1), position.clone().normalize());
+    return q;
+  }, [position]);
+  const pulse = useRef<THREE.Mesh>(null);
+  const r = region.spread;
+
+  useFrame(({ clock }) => {
+    if (!pulse.current) return;
+    const t = (clock.elapsedTime * 0.45) % 1;
+    pulse.current.scale.setScalar(0.7 + t * 0.9);
+    (pulse.current.material as THREE.MeshBasicMaterial).opacity = (1 - t) * 0.5;
+  });
+
+  return (
+    <group position={position} quaternion={quat}>
+      <mesh
+        onPointerOver={(e) => {
+          e.stopPropagation();
+          setHover(true);
+        }}
+        onPointerOut={() => setHover(false)}
+        onClick={(e: ThreeEvent<MouseEvent>) => {
+          e.stopPropagation();
+          onFocus(region);
+        }}
+      >
+        <circleGeometry args={[r * 1.15, 40]} />
+        <meshBasicMaterial color={CYAN} transparent opacity={hover ? 0.12 : 0.05} depthWrite={false} />
+      </mesh>
+      <mesh>
+        <ringGeometry args={[r * 0.94, r, 64]} />
+        <meshBasicMaterial color={CYAN} transparent opacity={0.55} side={THREE.DoubleSide} depthWrite={false} />
+      </mesh>
+      <mesh ref={pulse}>
+        <ringGeometry args={[r * 0.97, r, 64]} />
+        <meshBasicMaterial color={CYAN} transparent opacity={0.4} side={THREE.DoubleSide} depthWrite={false} />
+      </mesh>
+      <Html center distanceFactor={2.6} position={[0, r * 1.55, 0.02]} zIndexRange={[18, 0]}>
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onFocus(region);
+          }}
+          className="whitespace-nowrap rounded border border-sky-300/25 bg-[#050a13]/80 px-2 py-1 text-center font-mono uppercase backdrop-blur-sm transition-colors hover:border-sky-300/60"
+        >
+          <span className="block text-[10px] tracking-[0.22em] text-sky-100">{region.name}</span>
+          <span className="block text-[8px] tracking-[0.18em] text-sky-300/60">
+            {counts.assets} assets · {counts.ground} gateway
+          </span>
+        </button>
+      </Html>
+    </group>
+  );
+}
+
+/** Simplified trunk corridor between two operational regions (global view). */
+function TrunkRoute({ a, b }: { a: RegionDef; b: RegionDef }) {
+  const curve = useMemo(() => {
+    const p = new THREE.Vector3(...geoOnShell(a.lat, a.lon, 1.01));
+    const q = new THREE.Vector3(...geoOnShell(b.lat, b.lon, 1.01));
+    const mid = p.clone().add(q).multiplyScalar(0.5).setLength(1.42);
+    return new THREE.QuadraticBezierCurve3(p, mid, q);
+  }, [a, b]);
+  const packs = useRef<THREE.Group>(null);
+  const t = useRef(0);
+
+  useFrame((_, d) => {
+    t.current = (t.current + d * 0.13) % 1;
+    packs.current?.children.forEach((child, i) => {
+      const p = (t.current + i / 3) % 1;
+      child.position.copy(curve.getPointAt(p));
+      const mat = (child as THREE.Mesh).material as THREE.MeshBasicMaterial;
+      mat.opacity = Math.sin(p * Math.PI) * 0.9;
+    });
+  });
+
+  return (
+    <group>
+      <mesh>
+        <tubeGeometry args={[curve, 64, 0.0035, 6, false]} />
+        <meshBasicMaterial color="#38bdf8" transparent opacity={0.35} depthWrite={false} />
+      </mesh>
+      <group ref={packs}>
+        {[0, 1, 2].map((i) => (
+          <mesh key={i}>
+            <sphereGeometry args={[0.008, 8, 8]} />
+            <meshBasicMaterial color="#e0f2fe" transparent opacity={0.8} depthWrite={false} />
+          </mesh>
+        ))}
+      </group>
+      <Html center distanceFactor={3} position={curve.getPointAt(0.5)} zIndexRange={[16, 0]}>
+        <div className="pointer-events-none whitespace-nowrap font-mono text-[9px] uppercase tracking-[0.22em] text-sky-200/60">
+          Inter-region trunk
+        </div>
+      </Html>
+    </group>
+  );
+}
+
+/* ------------------------------------------------ vertical layer scaffold */
+
+/**
+ * The altitude ladder over an operational region: one disc per visual layer
+ * plus a vertical spine, so the operator can read which shell an asset is on.
+ */
+function LayerScaffold({ region, detailed }: { region: RegionDef; detailed: boolean }) {
+  const normal = useMemo(
+    () => new THREE.Vector3(...geoOnShell(region.lat, region.lon, 1)).normalize(),
+    [region]
+  );
+  const quat = useMemo(
+    () => new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 0, 1), normal),
+    [normal]
+  );
+
+  const spine = useMemo(() => {
+    const pts = [
+      normal.clone().multiplyScalar(1.0),
+      normal.clone().multiplyScalar(LAYER.satellite.radius + 0.03),
+    ];
+    return new THREE.BufferGeometry().setFromPoints(pts);
+  }, [normal]);
+
+  return (
+    <group>
+      {/* @ts-expect-error three line primitive */}
+      <line geometry={spine}>
+        <lineDashedMaterial color="#7dd3fc" transparent opacity={0.16} depthWrite={false} />
+      </line>
+
+      {LAYER_STACK.map((kind) => {
+        const def = LAYER[kind];
+        const r = def.radius;
+        const disc = region.spread * (0.9 + (r - 1) * 1.5);
+        const center = normal.clone().multiplyScalar(r);
+        return (
+          <group key={kind} position={center} quaternion={quat}>
+            <mesh>
+              <ringGeometry args={[disc * 0.985, disc, 72]} />
+              <meshBasicMaterial
+                color={def.color}
+                transparent
+                opacity={0.26}
+                side={THREE.DoubleSide}
+                depthWrite={false}
+              />
+            </mesh>
+            <mesh>
+              <circleGeometry args={[disc, 48]} />
+              <meshBasicMaterial
+                color={def.color}
+                transparent
+                opacity={0.035}
+                side={THREE.DoubleSide}
+                depthWrite={false}
+              />
+            </mesh>
+            {detailed && (
+              <Html
+                center
+                distanceFactor={1.5}
+                position={[-disc * 1.22, 0, 0]}
+                zIndexRange={[14, 0]}
+              >
+                <div className="pointer-events-none whitespace-nowrap text-right font-mono uppercase">
+                  <div
+                    className="text-[9px] tracking-[0.2em]"
+                    style={{ color: def.color, opacity: 0.9 }}
+                  >
+                    {def.label}
+                  </div>
+                  <div className="text-[8px] tracking-[0.18em] text-foreground/40">
+                    {def.altitude}
+                  </div>
+                </div>
+              </Html>
+            )}
+          </group>
+        );
+      })}
+    </group>
+  );
+}
+
 /* --------------------------------------------------------- camera focus */
 
 function CameraRig({
