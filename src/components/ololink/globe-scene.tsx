@@ -2,7 +2,15 @@
 
 import { Canvas, useFrame, useLoader, type ThreeEvent } from '@react-three/fiber';
 import { Html, OrbitControls, Stars } from '@react-three/drei';
-import { Suspense, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  createContext,
+  Suspense,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import * as THREE from 'three';
 
 import earthDay from '@/assets/earth_atmos_2048.jpg';
@@ -22,6 +30,20 @@ import {
   type WeatherCell,
 } from '@/lib/ololink';
 import type { OloLinkState, Selection } from '@/hooks/use-ololink';
+import {
+  LAYER,
+  LAYER_STACK,
+  LOD_LABEL,
+  REGIONS,
+  REGION_BY_ID,
+  assetVec,
+  geoOnShell,
+  layerRadius,
+  lodForDistance,
+  regionIdOf,
+  type LodLevel,
+  type RegionDef,
+} from '@/lib/layers';
 import {
   DOWNLINK_TARGETS,
   SAT_ORBITS,
@@ -43,7 +65,106 @@ const CYAN = '#38bdf8';
 const UP = new THREE.Vector3(0, 1, 0);
 
 function vec(a: Asset) {
-  return new THREE.Vector3(...geoToVec(a.lat, a.lon, a.altKm));
+  return new THREE.Vector3(...assetVec(a));
+}
+
+/* --------------------------------------------------- level-of-detail ctx */
+
+interface LodState {
+  level: LodLevel;
+  /** region the camera is currently looking at, if any */
+  region: string | null;
+}
+
+const LodContext = createContext<LodState>({ level: 'global', region: null });
+const useLod = () => useContext(LodContext);
+
+/** Watches the camera and derives view level + focused region. */
+function LodDriver({ onChange }: { onChange: (s: LodState) => void }) {
+  const last = useRef<LodState>({ level: 'global', region: null });
+  const dir = useRef(new THREE.Vector3());
+  const normals = useMemo(
+    () =>
+      REGIONS.map((r) => ({
+        id: r.id,
+        n: new THREE.Vector3(...geoOnShell(r.lat, r.lon, 1)).normalize(),
+      })),
+    []
+  );
+
+  useFrame(({ camera }) => {
+    const d = camera.position.length();
+    const level = lodForDistance(d);
+    dir.current.copy(camera.position).normalize();
+    let region: string | null = null;
+    let best = 0.62;
+    for (const r of normals) {
+      const dot = r.n.dot(dir.current);
+      if (dot > best) {
+        best = dot;
+        region = r.id;
+      }
+    }
+    if (level === 'global') region = null;
+    if (last.current.level !== level || last.current.region !== region) {
+      last.current = { level, region };
+      onChange(last.current);
+    }
+  });
+  return null;
+}
+
+/** Smoothly fades a group in/out so LOD changes never pop. */
+function Fade({
+  show,
+  speed = 3.2,
+  children,
+}: {
+  show: boolean;
+  speed?: number;
+  children: React.ReactNode;
+}) {
+  const group = useRef<THREE.Group>(null);
+  const v = useRef(show ? 1 : 0);
+  const mounted = useRef(show);
+  const [alive, setAlive] = useState(show);
+
+  useFrame((_, d) => {
+    const g = group.current;
+    v.current += ((show ? 1 : 0) - v.current) * Math.min(1, d * speed);
+    if (!g) return;
+    const a = v.current;
+    g.visible = a > 0.015;
+    g.scale.setScalar(0.92 + a * 0.08);
+    g.traverse((o) => {
+      const m = (o as THREE.Mesh).material as THREE.Material | THREE.Material[] | undefined;
+      if (!m) return;
+      const apply = (mm: THREE.Material) => {
+        const anyM = mm as THREE.Material & { userData: { base?: number }; opacity: number };
+        if (anyM.userData.base === undefined) anyM.userData.base = anyM.opacity;
+        anyM.transparent = true;
+        anyM.opacity = anyM.userData.base * a;
+      };
+      Array.isArray(m) ? m.forEach(apply) : apply(m);
+    });
+    if (!show && a < 0.02 && mounted.current) {
+      mounted.current = false;
+      setAlive(false);
+    } else if (show && !mounted.current) {
+      mounted.current = true;
+      setAlive(true);
+    }
+  });
+
+  useEffect(() => {
+    if (show) {
+      mounted.current = true;
+      setAlive(true);
+    }
+  }, [show]);
+
+  if (!alive && !show) return null;
+  return <group ref={group}>{children}</group>;
 }
 
 /** Quaternion that stands an object up on the sphere surface. */
@@ -946,6 +1067,8 @@ function AssetNode({
   showLabel,
   live,
   linking,
+  tether,
+  detail,
 }: {
   asset: Asset;
   selected: boolean;
@@ -955,6 +1078,10 @@ function AssetNode({
   live: LiveMap;
   /** node is inside an active communication window */
   linking?: boolean;
+  /** draw a plumb line down to the surface so altitude is readable */
+  tether?: boolean;
+  /** show the altitude-layer caption under the name */
+  detail?: boolean;
 }) {
   const [hover, setHover] = useState(false);
   const position = useMemo(() => vec(asset), [asset]);
@@ -967,12 +1094,20 @@ function AssetNode({
 
   const s =
     asset.kind === 'satellite'
-      ? 0.019
+      ? 0.021
       : asset.kind === 'haps'
-        ? 0.017
+        ? 0.018
         : asset.kind === 'drone'
-          ? 0.014
+          ? 0.013
           : 0.015;
+
+  /** plumb line from the asset's shell down to the surface below it */
+  const tetherGeom = useMemo(() => {
+    if (!tether || asset.altKm <= 0) return null;
+    const top = new THREE.Vector3(0, 0, 0);
+    const bottom = new THREE.Vector3(0, -(layerRadius(asset) - 1), 0);
+    return new THREE.BufferGeometry().setFromPoints([top, bottom]);
+  }, [tether, asset]);
 
   useFrame(({ clock, camera }) => {
     if (root.current) {
@@ -1037,14 +1172,34 @@ function AssetNode({
         />
       </mesh>
 
+      {tetherGeom && (
+        // @ts-expect-error three line primitive
+        <line geometry={tetherGeom}>
+          <lineBasicMaterial
+            color={KIND_COLOR[asset.kind]}
+            transparent
+            opacity={selected || onRoute ? 0.28 : 0.12}
+            depthWrite={false}
+          />
+        </line>
+      )}
+
       {(showLabel || hover || selected) && (
-        <Html center distanceFactor={1.6} position={[0, s * 4.4, 0]} zIndexRange={[20, 0]}>
+        <Html center distanceFactor={1.6} position={[0, s * 4.6, 0]} zIndexRange={[20, 0]}>
           <div
-            className={`pointer-events-none select-none whitespace-nowrap font-mono text-[9px] uppercase tracking-[0.18em] transition-opacity ${
+            className={`pointer-events-none select-none whitespace-nowrap text-center font-mono uppercase transition-opacity ${
               selected || hover ? 'text-foreground' : 'text-foreground/55'
             }`}
           >
-            {asset.name}
+            <div className="text-[9px] tracking-[0.18em]">{asset.name}</div>
+            {detail && (
+              <div
+                className="text-[8px] tracking-[0.16em]"
+                style={{ color: LAYER[asset.kind].color, opacity: 0.65 }}
+              >
+                {LAYER[asset.kind].label} · {LAYER[asset.kind].altitude}
+              </div>
+            )}
           </div>
         </Html>
       )}
@@ -1142,6 +1297,210 @@ function AffectedFootprint({ cell, color }: { cell: WeatherCell; color: string }
 }
 
 
+/* ------------------------------------------------ global-view abstractions */
+
+/** Operational region badge shown when the Earth is viewed from far away. */
+function RegionMarker({
+  region,
+  counts,
+  onFocus,
+}: {
+  region: RegionDef;
+  counts: { assets: number; ground: number };
+  onFocus: (r: RegionDef) => void;
+}) {
+  const [hover, setHover] = useState(false);
+  const position = useMemo(
+    () => new THREE.Vector3(...geoOnShell(region.lat, region.lon, 1.004)),
+    [region]
+  );
+  const quat = useMemo(() => {
+    const q = new THREE.Quaternion();
+    q.setFromUnitVectors(new THREE.Vector3(0, 0, 1), position.clone().normalize());
+    return q;
+  }, [position]);
+  const pulse = useRef<THREE.Mesh>(null);
+  const r = region.spread;
+
+  useFrame(({ clock }) => {
+    if (!pulse.current) return;
+    const t = (clock.elapsedTime * 0.45) % 1;
+    pulse.current.scale.setScalar(0.7 + t * 0.9);
+    (pulse.current.material as THREE.MeshBasicMaterial).opacity = (1 - t) * 0.5;
+  });
+
+  return (
+    <group position={position} quaternion={quat}>
+      <mesh
+        onPointerOver={(e) => {
+          e.stopPropagation();
+          setHover(true);
+        }}
+        onPointerOut={() => setHover(false)}
+        onClick={(e: ThreeEvent<MouseEvent>) => {
+          e.stopPropagation();
+          onFocus(region);
+        }}
+      >
+        <circleGeometry args={[r * 1.15, 40]} />
+        <meshBasicMaterial color={CYAN} transparent opacity={hover ? 0.12 : 0.05} depthWrite={false} />
+      </mesh>
+      <mesh>
+        <ringGeometry args={[r * 0.94, r, 64]} />
+        <meshBasicMaterial color={CYAN} transparent opacity={0.55} side={THREE.DoubleSide} depthWrite={false} />
+      </mesh>
+      <mesh ref={pulse}>
+        <ringGeometry args={[r * 0.97, r, 64]} />
+        <meshBasicMaterial color={CYAN} transparent opacity={0.4} side={THREE.DoubleSide} depthWrite={false} />
+      </mesh>
+      <Html center distanceFactor={2.6} position={[0, r * 1.55, 0.02]} zIndexRange={[18, 0]}>
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onFocus(region);
+          }}
+          className="whitespace-nowrap rounded border border-sky-300/25 bg-[#050a13]/80 px-2 py-1 text-center font-mono uppercase backdrop-blur-sm transition-colors hover:border-sky-300/60"
+        >
+          <span className="block text-[10px] tracking-[0.22em] text-sky-100">{region.name}</span>
+          <span className="block text-[8px] tracking-[0.18em] text-sky-300/60">
+            {counts.assets} assets · {counts.ground} gateway
+          </span>
+        </button>
+      </Html>
+    </group>
+  );
+}
+
+/** Simplified trunk corridor between two operational regions (global view). */
+function TrunkRoute({ a, b }: { a: RegionDef; b: RegionDef }) {
+  const curve = useMemo(() => {
+    const p = new THREE.Vector3(...geoOnShell(a.lat, a.lon, 1.01));
+    const q = new THREE.Vector3(...geoOnShell(b.lat, b.lon, 1.01));
+    const mid = p.clone().add(q).multiplyScalar(0.5).setLength(1.42);
+    return new THREE.QuadraticBezierCurve3(p, mid, q);
+  }, [a, b]);
+  const packs = useRef<THREE.Group>(null);
+  const t = useRef(0);
+
+  useFrame((_, d) => {
+    t.current = (t.current + d * 0.13) % 1;
+    packs.current?.children.forEach((child, i) => {
+      const p = (t.current + i / 3) % 1;
+      child.position.copy(curve.getPointAt(p));
+      const mat = (child as THREE.Mesh).material as THREE.MeshBasicMaterial;
+      mat.opacity = Math.sin(p * Math.PI) * 0.9;
+    });
+  });
+
+  return (
+    <group>
+      <mesh>
+        <tubeGeometry args={[curve, 64, 0.0035, 6, false]} />
+        <meshBasicMaterial color="#38bdf8" transparent opacity={0.35} depthWrite={false} />
+      </mesh>
+      <group ref={packs}>
+        {[0, 1, 2].map((i) => (
+          <mesh key={i}>
+            <sphereGeometry args={[0.008, 8, 8]} />
+            <meshBasicMaterial color="#e0f2fe" transparent opacity={0.8} depthWrite={false} />
+          </mesh>
+        ))}
+      </group>
+      <Html center distanceFactor={3} position={curve.getPointAt(0.5)} zIndexRange={[16, 0]}>
+        <div className="pointer-events-none whitespace-nowrap font-mono text-[9px] uppercase tracking-[0.22em] text-sky-200/60">
+          Inter-region trunk
+        </div>
+      </Html>
+    </group>
+  );
+}
+
+/* ------------------------------------------------ vertical layer scaffold */
+
+/**
+ * The altitude ladder over an operational region: one disc per visual layer
+ * plus a vertical spine, so the operator can read which shell an asset is on.
+ */
+function LayerScaffold({ region, detailed }: { region: RegionDef; detailed: boolean }) {
+  const normal = useMemo(
+    () => new THREE.Vector3(...geoOnShell(region.lat, region.lon, 1)).normalize(),
+    [region]
+  );
+  const quat = useMemo(
+    () => new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 0, 1), normal),
+    [normal]
+  );
+
+  const spine = useMemo(() => {
+    const pts = [
+      normal.clone().multiplyScalar(1.0),
+      normal.clone().multiplyScalar(LAYER.satellite.radius + 0.03),
+    ];
+    return new THREE.BufferGeometry().setFromPoints(pts);
+  }, [normal]);
+
+  return (
+    <group>
+      {/* @ts-expect-error three line primitive */}
+      <line geometry={spine}>
+        <lineDashedMaterial color="#7dd3fc" transparent opacity={0.16} depthWrite={false} />
+      </line>
+
+      {LAYER_STACK.map((kind) => {
+        const def = LAYER[kind];
+        const r = def.radius;
+        const disc = region.spread * (0.9 + (r - 1) * 1.5);
+        const center = normal.clone().multiplyScalar(r);
+        return (
+          <group key={kind} position={center} quaternion={quat}>
+            <mesh>
+              <ringGeometry args={[disc * 0.985, disc, 72]} />
+              <meshBasicMaterial
+                color={def.color}
+                transparent
+                opacity={0.26}
+                side={THREE.DoubleSide}
+                depthWrite={false}
+              />
+            </mesh>
+            <mesh>
+              <circleGeometry args={[disc, 48]} />
+              <meshBasicMaterial
+                color={def.color}
+                transparent
+                opacity={0.035}
+                side={THREE.DoubleSide}
+                depthWrite={false}
+              />
+            </mesh>
+            {detailed && (
+              <Html
+                center
+                distanceFactor={1.5}
+                position={[-disc * 1.22, 0, 0]}
+                zIndexRange={[14, 0]}
+              >
+                <div className="pointer-events-none whitespace-nowrap text-right font-mono uppercase">
+                  <div
+                    className="text-[9px] tracking-[0.2em]"
+                    style={{ color: def.color, opacity: 0.9 }}
+                  >
+                    {def.label}
+                  </div>
+                  <div className="text-[8px] tracking-[0.18em] text-foreground/40">
+                    {def.altitude}
+                  </div>
+                </div>
+              </Html>
+            )}
+          </group>
+        );
+      })}
+    </group>
+  );
+}
+
 /* --------------------------------------------------------- camera focus */
 
 function CameraRig({
@@ -1149,11 +1508,16 @@ function CameraRig({
   live,
   approach,
   controls,
+  flyTo,
+  onArrive,
 }: {
   focusIds: string[] | null;
   live: LiveMap;
   approach: number;
   controls: React.RefObject<any>;
+  /** one-shot camera transition to a point on the globe */
+  flyTo: { point: THREE.Vector3; distance: number } | null;
+  onArrive: () => void;
 }) {
   const desired = useRef(new THREE.Vector3());
   const target = useRef(new THREE.Vector3());
@@ -1161,6 +1525,17 @@ function CameraRig({
     const c = controls.current;
     if (!c) return;
     const k = 1 - Math.exp(-2.6 * d);
+
+    if (flyTo) {
+      const t = flyTo.point;
+      c.target.lerp(t, k * 0.9);
+      desired.current.copy(t).setLength(flyTo.distance);
+      camera.position.lerp(desired.current, k * 0.8);
+      c.update();
+      if (camera.position.distanceTo(desired.current) < 0.035) onArrive();
+      return;
+    }
+
     if (focusIds && focusIds.length) {
       target.current.set(0, 0, 0);
       let n = 0;
@@ -1175,7 +1550,7 @@ function CameraRig({
       target.current.multiplyScalar(1 / n);
       const t = target.current;
       c.target.lerp(t, k);
-      const dist = Math.max(1.42, t.length() + approach);
+      const dist = Math.max(1.5, t.length() + approach);
       desired.current.copy(t).setLength(dist);
       camera.position.lerp(desired.current, k * 0.95);
     } else {
@@ -1188,7 +1563,7 @@ function CameraRig({
 
 /* ------------------------------------------------------------ the scene */
 
-function SceneContent({ state }: { state: OloLinkState }) {
+function SceneContent({ state, onLod }: { state: OloLinkState; onLod: (s: LodState) => void }) {
   const { profile, links, selection, select, layers, route, previousRoute, rerouteSeq } = state;
   const controls = useRef<any>(null);
 
@@ -1224,6 +1599,89 @@ function SceneContent({ state }: { state: OloLinkState }) {
 
   const approach = selection?.type === 'asset' ? 0.42 : 0.85;
 
+  /* ------------------------------------------------------ level of detail */
+
+  const [lod, setLod] = useState<LodState>({ level: 'global', region: null });
+  const [flyTo, setFlyTo] = useState<{ point: THREE.Vector3; distance: number } | null>(null);
+
+  useEffect(() => {
+    onLod(lod);
+  }, [lod, onLod]);
+
+  /** the region the operator is working in: camera-derived, or the selection's */
+  const activeRegion = useMemo(() => {
+    if (selection?.type === 'asset') {
+      const r = ASSET_BY_ID[selection.id];
+      if (r) return regionIdOf(r) ?? lod.region;
+    }
+    return lod.region;
+  }, [selection, lod.region]);
+
+  const detailed = lod.level !== 'global';
+  const localView = lod.level === 'local';
+
+  const inScope = useMemo(
+    () => (regionId: string | null) => !activeRegion || regionId === activeRegion,
+    [activeRegion]
+  );
+
+  /** progressive reveal: only surface + orbital tiers exist at global range */
+  const visibleAssets = useMemo(
+    () =>
+      ASSETS.filter((a) => {
+        const region = regionIdOf(a);
+        if (a.kind === 'satellite') return true;
+        if (a.kind === 'ground') return true;
+        if (!detailed) return false;
+        return inScope(region);
+      }),
+    [detailed, inScope]
+  );
+  const visibleIds = useMemo(() => new Set(visibleAssets.map((a) => a.id)), [visibleAssets]);
+
+  const visibleLinks = useMemo(
+    () =>
+      links.filter((l) => {
+        const from = ASSET_BY_ID[l.segment.from];
+        const to = ASSET_BY_ID[l.segment.to];
+        if (!from || !to) return false;
+        if (!visibleIds.has(from.id) || !visibleIds.has(to.id)) return false;
+        // at global range only the primary space-to-ground path is drawn
+        if (!detailed) return from.kind === 'satellite' && to.kind === 'ground';
+        return true;
+      }),
+    [links, visibleIds, detailed]
+  );
+
+  const scopedRegions = useMemo(
+    () => REGIONS.filter((r) => inScope(r.id)),
+    [inScope]
+  );
+
+  const visibleWeather = useMemo(() => {
+    if (!detailed) return [];
+    return profile.weather.filter((c) => {
+      if (!activeRegion) return true;
+      const r = REGION_BY_ID[activeRegion];
+      if (!r) return true;
+      return Math.abs(c.lat - r.lat) < 25 && Math.abs(c.lon - r.lon) < 30;
+    });
+  }, [profile.weather, detailed, activeRegion]);
+
+  const regionCounts = useMemo(
+    () =>
+      Object.fromEntries(
+        REGIONS.map((r) => [
+          r.id,
+          {
+            assets: ASSETS.filter((a) => a.region === r.name).length,
+            ground: ASSETS.filter((a) => a.region === r.name && a.kind === 'ground').length,
+          },
+        ])
+      ) as Record<string, { assets: number; ground: number }>,
+    []
+  );
+
   return (
     <>
       {/* sun: gives a visible day / night terminator across both regions */}
@@ -1241,6 +1699,7 @@ function SceneContent({ state }: { state: OloLinkState }) {
       />
       <Stars radius={90} depth={40} count={2200} factor={2.6} saturation={0} fade speed={0.3} />
 
+      <LodDriver onChange={setLod} />
 
       <Suspense fallback={null}>
         <Earth />
@@ -1250,8 +1709,34 @@ function SceneContent({ state }: { state: OloLinkState }) {
 
       {layers.orbits && SATELLITES.map((a) => <OrbitTrack key={a.id} elId={a.id} />)}
 
+      {/* GLOBAL — operational regions and the trunk between them */}
+      <Fade show={!detailed}>
+        {REGIONS.map((r) => (
+          <RegionMarker
+            key={r.id}
+            region={r}
+            counts={regionCounts[r.id]!}
+            onFocus={(reg) => {
+              select(null);
+              setFlyTo({
+                point: new THREE.Vector3(...geoOnShell(reg.lat, reg.lon, 1.06)),
+                distance: 1.72,
+              });
+            }}
+          />
+        ))}
+        {REGIONS[0] && REGIONS[1] && <TrunkRoute a={REGIONS[0]} b={REGIONS[1]} />}
+      </Fade>
+
+      {/* REGIONAL / LOCAL — altitude ladder above the operational region */}
+      <Fade show={detailed}>
+        {scopedRegions.map((r) => (
+          <LayerScaffold key={r.id} region={r} detailed={localView} />
+        ))}
+      </Fade>
+
       {layers.routes &&
-        links.map((l) =>
+        visibleLinks.map((l) =>
           ASSET_BY_ID[l.segment.from]?.kind === 'satellite' ? (
             <DownlinkBeam
               key={l.segment.id}
@@ -1275,7 +1760,7 @@ function SceneContent({ state }: { state: OloLinkState }) {
         )}
 
       {/* AI rerouting: old path dissolves, new path draws itself in */}
-      {layers.routes && previousRoute && previousRoute.length > 0 && (
+      {layers.routes && detailed && previousRoute && previousRoute.length > 0 && (
         <>
           <ProgressiveRoute
             key={`out-${rerouteSeq}`}
@@ -1294,20 +1779,27 @@ function SceneContent({ state }: { state: OloLinkState }) {
         </>
       )}
 
-      {ASSETS.map((a) => (
+      {visibleAssets.map((a) => (
         <AssetNode
           key={a.id}
           asset={a}
           selected={selection?.type === 'asset' && selection.id === a.id}
           onRoute={routeAssets.has(a.id)}
           onSelect={select}
-          showLabel={layers.labels && (routeAssets.has(a.id) || windowSats.has(a.id))}
+          showLabel={
+            layers.labels &&
+            (detailed
+              ? routeAssets.has(a.id) || windowSats.has(a.id) || a.kind !== 'satellite'
+              : routeAssets.has(a.id) && a.kind === 'satellite')
+          }
+          detail={localView}
+          tether={detailed && a.altKm > 0 && a.kind !== 'satellite'}
           live={live}
           linking={windowSats.has(a.id) || windowReceivers.has(a.id)}
         />
       ))}
 
-      {layers.weather && profile.weather.map((c) => <WeatherBlob key={c.id} cell={c} />)}
+      {layers.weather && visibleWeather.map((c) => <WeatherBlob key={c.id} cell={c} />)}
 
       <OrbitControls
         ref={controls}
@@ -1315,29 +1807,61 @@ function SceneContent({ state }: { state: OloLinkState }) {
         enableDamping
         dampingFactor={0.08}
         rotateSpeed={0.45}
-        minDistance={1.18}
-        maxDistance={5}
-        autoRotate={!selection && state.running}
+        minDistance={1.32}
+        maxDistance={5.2}
+        autoRotate={!selection && !flyTo && lod.level === 'global' && state.running}
         autoRotateSpeed={0.22}
       />
-      <CameraRig focusIds={focus} live={live} approach={approach} controls={controls} />
+      <CameraRig
+        focusIds={flyTo ? null : focus}
+        live={live}
+        approach={approach}
+        controls={controls}
+        flyTo={flyTo}
+        onArrive={() => setFlyTo(null)}
+      />
     </>
   );
 }
 
 export function GlobeScene({ state }: { state: OloLinkState }) {
+  const [lod, setLod] = useState<LodState>({ level: 'global', region: null });
+  const onLod = useMemo(() => (s: LodState) => setLod(s), []);
+
   return (
-    <Canvas
-      /* framed over the Pacific so both Thailand and the United States are in view */
-      camera={{ position: [-2.807, 1.31, -0.123], fov: 42 }}
-      dpr={[1, 2]}
-      gl={{ antialias: true }}
-      onPointerMissed={() => state.select(null)}
-      className="!absolute inset-0"
-    >
-      <color attach="background" args={['#000000']} />
-      <SceneContent state={state} />
-    </Canvas>
+    <>
+      <Canvas
+        /* framed over the Pacific so both Thailand and the United States are in view */
+        camera={{ position: [-2.807, 1.31, -0.123], fov: 42 }}
+        dpr={[1, 2]}
+        gl={{ antialias: true }}
+        onPointerMissed={() => state.select(null)}
+        className="!absolute inset-0"
+      >
+        <color attach="background" args={['#000000']} />
+        <LodContext.Provider value={lod}>
+          <SceneContent state={state} onLod={onLod} />
+        </LodContext.Provider>
+      </Canvas>
+
+      {/* view-level indicator — tells the operator which detail tier is active */}
+      <div className="pointer-events-none absolute left-1/2 top-[68px] z-20 -translate-x-1/2">
+        <div className="flex items-center gap-2 rounded-full border border-white/[0.07] bg-[#070b14]/70 px-3 py-1 backdrop-blur-md">
+          {(['global', 'regional', 'local'] as LodLevel[]).map((l) => (
+            <span
+              key={l}
+              className={`h-1 w-5 rounded-full transition-colors ${
+                lod.level === l ? 'bg-sky-300' : 'bg-white/12'
+              }`}
+            />
+          ))}
+          <span className="font-mono text-[9px] uppercase tracking-[0.24em] text-sky-100/70">
+            {LOD_LABEL[lod.level]}
+            {lod.region ? ` · ${REGION_BY_ID[lod.region]?.short}` : ''}
+          </span>
+        </div>
+      </div>
+    </>
   );
 }
 
