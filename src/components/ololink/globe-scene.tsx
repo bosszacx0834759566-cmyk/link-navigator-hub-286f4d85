@@ -1067,6 +1067,8 @@ function AssetNode({
   showLabel,
   live,
   linking,
+  tether,
+  detail,
 }: {
   asset: Asset;
   selected: boolean;
@@ -1076,6 +1078,10 @@ function AssetNode({
   live: LiveMap;
   /** node is inside an active communication window */
   linking?: boolean;
+  /** draw a plumb line down to the surface so altitude is readable */
+  tether?: boolean;
+  /** show the altitude-layer caption under the name */
+  detail?: boolean;
 }) {
   const [hover, setHover] = useState(false);
   const position = useMemo(() => vec(asset), [asset]);
@@ -1088,12 +1094,20 @@ function AssetNode({
 
   const s =
     asset.kind === 'satellite'
-      ? 0.019
+      ? 0.021
       : asset.kind === 'haps'
-        ? 0.017
+        ? 0.018
         : asset.kind === 'drone'
-          ? 0.014
+          ? 0.013
           : 0.015;
+
+  /** plumb line from the asset's shell down to the surface below it */
+  const tetherGeom = useMemo(() => {
+    if (!tether || asset.altKm <= 0) return null;
+    const top = new THREE.Vector3(0, 0, 0);
+    const bottom = new THREE.Vector3(0, -(layerRadius(asset) - 1), 0);
+    return new THREE.BufferGeometry().setFromPoints([top, bottom]);
+  }, [tether, asset]);
 
   useFrame(({ clock, camera }) => {
     if (root.current) {
@@ -1158,14 +1172,34 @@ function AssetNode({
         />
       </mesh>
 
+      {tetherGeom && (
+        // @ts-expect-error three line primitive
+        <line geometry={tetherGeom}>
+          <lineBasicMaterial
+            color={KIND_COLOR[asset.kind]}
+            transparent
+            opacity={selected || onRoute ? 0.28 : 0.12}
+            depthWrite={false}
+          />
+        </line>
+      )}
+
       {(showLabel || hover || selected) && (
-        <Html center distanceFactor={1.6} position={[0, s * 4.4, 0]} zIndexRange={[20, 0]}>
+        <Html center distanceFactor={1.6} position={[0, s * 4.6, 0]} zIndexRange={[20, 0]}>
           <div
-            className={`pointer-events-none select-none whitespace-nowrap font-mono text-[9px] uppercase tracking-[0.18em] transition-opacity ${
+            className={`pointer-events-none select-none whitespace-nowrap text-center font-mono uppercase transition-opacity ${
               selected || hover ? 'text-foreground' : 'text-foreground/55'
             }`}
           >
-            {asset.name}
+            <div className="text-[9px] tracking-[0.18em]">{asset.name}</div>
+            {detail && (
+              <div
+                className="text-[8px] tracking-[0.16em]"
+                style={{ color: LAYER[asset.kind].color, opacity: 0.65 }}
+              >
+                {LAYER[asset.kind].label} · {LAYER[asset.kind].altitude}
+              </div>
+            )}
           </div>
         </Html>
       )}
