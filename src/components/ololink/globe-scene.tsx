@@ -2,7 +2,15 @@
 
 import { Canvas, useFrame, useLoader, type ThreeEvent } from '@react-three/fiber';
 import { Html, OrbitControls, Stars } from '@react-three/drei';
-import { Suspense, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  createContext,
+  Suspense,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import * as THREE from 'three';
 
 import earthDay from '@/assets/earth_atmos_2048.jpg';
@@ -22,6 +30,20 @@ import {
   type WeatherCell,
 } from '@/lib/ololink';
 import type { OloLinkState, Selection } from '@/hooks/use-ololink';
+import {
+  LAYER,
+  LAYER_STACK,
+  LOD_LABEL,
+  REGIONS,
+  REGION_BY_ID,
+  assetVec,
+  geoOnShell,
+  layerRadius,
+  lodForDistance,
+  regionIdOf,
+  type LodLevel,
+  type RegionDef,
+} from '@/lib/layers';
 import {
   DOWNLINK_TARGETS,
   SAT_ORBITS,
@@ -43,7 +65,106 @@ const CYAN = '#38bdf8';
 const UP = new THREE.Vector3(0, 1, 0);
 
 function vec(a: Asset) {
-  return new THREE.Vector3(...geoToVec(a.lat, a.lon, a.altKm));
+  return new THREE.Vector3(...assetVec(a));
+}
+
+/* --------------------------------------------------- level-of-detail ctx */
+
+interface LodState {
+  level: LodLevel;
+  /** region the camera is currently looking at, if any */
+  region: string | null;
+}
+
+const LodContext = createContext<LodState>({ level: 'global', region: null });
+const useLod = () => useContext(LodContext);
+
+/** Watches the camera and derives view level + focused region. */
+function LodDriver({ onChange }: { onChange: (s: LodState) => void }) {
+  const last = useRef<LodState>({ level: 'global', region: null });
+  const dir = useRef(new THREE.Vector3());
+  const normals = useMemo(
+    () =>
+      REGIONS.map((r) => ({
+        id: r.id,
+        n: new THREE.Vector3(...geoOnShell(r.lat, r.lon, 1)).normalize(),
+      })),
+    []
+  );
+
+  useFrame(({ camera }) => {
+    const d = camera.position.length();
+    const level = lodForDistance(d);
+    dir.current.copy(camera.position).normalize();
+    let region: string | null = null;
+    let best = 0.62;
+    for (const r of normals) {
+      const dot = r.n.dot(dir.current);
+      if (dot > best) {
+        best = dot;
+        region = r.id;
+      }
+    }
+    if (level === 'global') region = null;
+    if (last.current.level !== level || last.current.region !== region) {
+      last.current = { level, region };
+      onChange(last.current);
+    }
+  });
+  return null;
+}
+
+/** Smoothly fades a group in/out so LOD changes never pop. */
+function Fade({
+  show,
+  speed = 3.2,
+  children,
+}: {
+  show: boolean;
+  speed?: number;
+  children: React.ReactNode;
+}) {
+  const group = useRef<THREE.Group>(null);
+  const v = useRef(show ? 1 : 0);
+  const mounted = useRef(show);
+  const [alive, setAlive] = useState(show);
+
+  useFrame((_, d) => {
+    const g = group.current;
+    v.current += ((show ? 1 : 0) - v.current) * Math.min(1, d * speed);
+    if (!g) return;
+    const a = v.current;
+    g.visible = a > 0.015;
+    g.scale.setScalar(0.92 + a * 0.08);
+    g.traverse((o) => {
+      const m = (o as THREE.Mesh).material as THREE.Material | THREE.Material[] | undefined;
+      if (!m) return;
+      const apply = (mm: THREE.Material) => {
+        const anyM = mm as THREE.Material & { userData: { base?: number }; opacity: number };
+        if (anyM.userData.base === undefined) anyM.userData.base = anyM.opacity;
+        anyM.transparent = true;
+        anyM.opacity = anyM.userData.base * a;
+      };
+      Array.isArray(m) ? m.forEach(apply) : apply(m);
+    });
+    if (!show && a < 0.02 && mounted.current) {
+      mounted.current = false;
+      setAlive(false);
+    } else if (show && !mounted.current) {
+      mounted.current = true;
+      setAlive(true);
+    }
+  });
+
+  useEffect(() => {
+    if (show) {
+      mounted.current = true;
+      setAlive(true);
+    }
+  }, [show]);
+
+  if (!alive && !show) return null;
+  return <group ref={group}>{children}</group>;
 }
 
 /** Quaternion that stands an object up on the sphere surface. */
