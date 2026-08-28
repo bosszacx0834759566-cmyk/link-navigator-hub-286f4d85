@@ -1563,7 +1563,7 @@ function CameraRig({
 
 /* ------------------------------------------------------------ the scene */
 
-function SceneContent({ state }: { state: OloLinkState }) {
+function SceneContent({ state, onLod }: { state: OloLinkState; onLod: (s: LodState) => void }) {
   const { profile, links, selection, select, layers, route, previousRoute, rerouteSeq } = state;
   const controls = useRef<any>(null);
 
@@ -1599,6 +1599,89 @@ function SceneContent({ state }: { state: OloLinkState }) {
 
   const approach = selection?.type === 'asset' ? 0.42 : 0.85;
 
+  /* ------------------------------------------------------ level of detail */
+
+  const [lod, setLod] = useState<LodState>({ level: 'global', region: null });
+  const [flyTo, setFlyTo] = useState<{ point: THREE.Vector3; distance: number } | null>(null);
+
+  useEffect(() => {
+    onLod(lod);
+  }, [lod, onLod]);
+
+  /** the region the operator is working in: camera-derived, or the selection's */
+  const activeRegion = useMemo(() => {
+    if (selection?.type === 'asset') {
+      const r = ASSET_BY_ID[selection.id];
+      if (r) return regionIdOf(r) ?? lod.region;
+    }
+    return lod.region;
+  }, [selection, lod.region]);
+
+  const detailed = lod.level !== 'global';
+  const localView = lod.level === 'local';
+
+  const inScope = useMemo(
+    () => (regionId: string | null) => !activeRegion || regionId === activeRegion,
+    [activeRegion]
+  );
+
+  /** progressive reveal: only surface + orbital tiers exist at global range */
+  const visibleAssets = useMemo(
+    () =>
+      ASSETS.filter((a) => {
+        const region = regionIdOf(a);
+        if (a.kind === 'satellite') return true;
+        if (a.kind === 'ground') return true;
+        if (!detailed) return false;
+        return inScope(region);
+      }),
+    [detailed, inScope]
+  );
+  const visibleIds = useMemo(() => new Set(visibleAssets.map((a) => a.id)), [visibleAssets]);
+
+  const visibleLinks = useMemo(
+    () =>
+      links.filter((l) => {
+        const from = ASSET_BY_ID[l.segment.from];
+        const to = ASSET_BY_ID[l.segment.to];
+        if (!from || !to) return false;
+        if (!visibleIds.has(from.id) || !visibleIds.has(to.id)) return false;
+        // at global range only the primary space-to-ground path is drawn
+        if (!detailed) return from.kind === 'satellite' && to.kind === 'ground';
+        return true;
+      }),
+    [links, visibleIds, detailed]
+  );
+
+  const scopedRegions = useMemo(
+    () => REGIONS.filter((r) => inScope(r.id)),
+    [inScope]
+  );
+
+  const visibleWeather = useMemo(() => {
+    if (!detailed) return [];
+    return profile.weather.filter((c) => {
+      if (!activeRegion) return true;
+      const r = REGION_BY_ID[activeRegion];
+      if (!r) return true;
+      return Math.abs(c.lat - r.lat) < 25 && Math.abs(c.lon - r.lon) < 30;
+    });
+  }, [profile.weather, detailed, activeRegion]);
+
+  const regionCounts = useMemo(
+    () =>
+      Object.fromEntries(
+        REGIONS.map((r) => [
+          r.id,
+          {
+            assets: ASSETS.filter((a) => a.region === r.name).length,
+            ground: ASSETS.filter((a) => a.region === r.name && a.kind === 'ground').length,
+          },
+        ])
+      ) as Record<string, { assets: number; ground: number }>,
+    []
+  );
+
   return (
     <>
       {/* sun: gives a visible day / night terminator across both regions */}
@@ -1616,6 +1699,7 @@ function SceneContent({ state }: { state: OloLinkState }) {
       />
       <Stars radius={90} depth={40} count={2200} factor={2.6} saturation={0} fade speed={0.3} />
 
+      <LodDriver onChange={setLod} />
 
       <Suspense fallback={null}>
         <Earth />
@@ -1625,8 +1709,34 @@ function SceneContent({ state }: { state: OloLinkState }) {
 
       {layers.orbits && SATELLITES.map((a) => <OrbitTrack key={a.id} elId={a.id} />)}
 
+      {/* GLOBAL — operational regions and the trunk between them */}
+      <Fade show={!detailed}>
+        {REGIONS.map((r) => (
+          <RegionMarker
+            key={r.id}
+            region={r}
+            counts={regionCounts[r.id]!}
+            onFocus={(reg) => {
+              select(null);
+              setFlyTo({
+                point: new THREE.Vector3(...geoOnShell(reg.lat, reg.lon, 1.06)),
+                distance: 1.72,
+              });
+            }}
+          />
+        ))}
+        {REGIONS[0] && REGIONS[1] && <TrunkRoute a={REGIONS[0]} b={REGIONS[1]} />}
+      </Fade>
+
+      {/* REGIONAL / LOCAL — altitude ladder above the operational region */}
+      <Fade show={detailed}>
+        {scopedRegions.map((r) => (
+          <LayerScaffold key={r.id} region={r} detailed={localView} />
+        ))}
+      </Fade>
+
       {layers.routes &&
-        links.map((l) =>
+        visibleLinks.map((l) =>
           ASSET_BY_ID[l.segment.from]?.kind === 'satellite' ? (
             <DownlinkBeam
               key={l.segment.id}
@@ -1650,7 +1760,7 @@ function SceneContent({ state }: { state: OloLinkState }) {
         )}
 
       {/* AI rerouting: old path dissolves, new path draws itself in */}
-      {layers.routes && previousRoute && previousRoute.length > 0 && (
+      {layers.routes && detailed && previousRoute && previousRoute.length > 0 && (
         <>
           <ProgressiveRoute
             key={`out-${rerouteSeq}`}
@@ -1669,20 +1779,27 @@ function SceneContent({ state }: { state: OloLinkState }) {
         </>
       )}
 
-      {ASSETS.map((a) => (
+      {visibleAssets.map((a) => (
         <AssetNode
           key={a.id}
           asset={a}
           selected={selection?.type === 'asset' && selection.id === a.id}
           onRoute={routeAssets.has(a.id)}
           onSelect={select}
-          showLabel={layers.labels && (routeAssets.has(a.id) || windowSats.has(a.id))}
+          showLabel={
+            layers.labels &&
+            (detailed
+              ? routeAssets.has(a.id) || windowSats.has(a.id) || a.kind !== 'satellite'
+              : routeAssets.has(a.id) && a.kind === 'satellite')
+          }
+          detail={localView}
+          tether={detailed && a.altKm > 0 && a.kind !== 'satellite'}
           live={live}
           linking={windowSats.has(a.id) || windowReceivers.has(a.id)}
         />
       ))}
 
-      {layers.weather && profile.weather.map((c) => <WeatherBlob key={c.id} cell={c} />)}
+      {layers.weather && visibleWeather.map((c) => <WeatherBlob key={c.id} cell={c} />)}
 
       <OrbitControls
         ref={controls}
@@ -1690,29 +1807,61 @@ function SceneContent({ state }: { state: OloLinkState }) {
         enableDamping
         dampingFactor={0.08}
         rotateSpeed={0.45}
-        minDistance={1.18}
-        maxDistance={5}
-        autoRotate={!selection && state.running}
+        minDistance={1.32}
+        maxDistance={5.2}
+        autoRotate={!selection && !flyTo && lod.level === 'global' && state.running}
         autoRotateSpeed={0.22}
       />
-      <CameraRig focusIds={focus} live={live} approach={approach} controls={controls} />
+      <CameraRig
+        focusIds={flyTo ? null : focus}
+        live={live}
+        approach={approach}
+        controls={controls}
+        flyTo={flyTo}
+        onArrive={() => setFlyTo(null)}
+      />
     </>
   );
 }
 
 export function GlobeScene({ state }: { state: OloLinkState }) {
+  const [lod, setLod] = useState<LodState>({ level: 'global', region: null });
+  const onLod = useMemo(() => (s: LodState) => setLod(s), []);
+
   return (
-    <Canvas
-      /* framed over the Pacific so both Thailand and the United States are in view */
-      camera={{ position: [-2.807, 1.31, -0.123], fov: 42 }}
-      dpr={[1, 2]}
-      gl={{ antialias: true }}
-      onPointerMissed={() => state.select(null)}
-      className="!absolute inset-0"
-    >
-      <color attach="background" args={['#000000']} />
-      <SceneContent state={state} />
-    </Canvas>
+    <>
+      <Canvas
+        /* framed over the Pacific so both Thailand and the United States are in view */
+        camera={{ position: [-2.807, 1.31, -0.123], fov: 42 }}
+        dpr={[1, 2]}
+        gl={{ antialias: true }}
+        onPointerMissed={() => state.select(null)}
+        className="!absolute inset-0"
+      >
+        <color attach="background" args={['#000000']} />
+        <LodContext.Provider value={lod}>
+          <SceneContent state={state} onLod={onLod} />
+        </LodContext.Provider>
+      </Canvas>
+
+      {/* view-level indicator — tells the operator which detail tier is active */}
+      <div className="pointer-events-none absolute left-1/2 top-[68px] z-20 -translate-x-1/2">
+        <div className="flex items-center gap-2 rounded-full border border-white/[0.07] bg-[#070b14]/70 px-3 py-1 backdrop-blur-md">
+          {(['global', 'regional', 'local'] as LodLevel[]).map((l) => (
+            <span
+              key={l}
+              className={`h-1 w-5 rounded-full transition-colors ${
+                lod.level === l ? 'bg-sky-300' : 'bg-white/12'
+              }`}
+            />
+          ))}
+          <span className="font-mono text-[9px] uppercase tracking-[0.24em] text-sky-100/70">
+            {LOD_LABEL[lod.level]}
+            {lod.region ? ` · ${REGION_BY_ID[lod.region]?.short}` : ''}
+          </span>
+        </div>
+      </div>
+    </>
   );
 }
 
