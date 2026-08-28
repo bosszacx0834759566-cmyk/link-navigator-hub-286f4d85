@@ -7,7 +7,8 @@
  */
 
 import * as THREE from 'three';
-import { ASSETS, ASSET_BY_ID, SEGMENTS, geoToVec, type Asset } from '@/lib/ololink';
+import { ASSETS, ASSET_BY_ID, SEGMENTS, type Asset } from '@/lib/ololink';
+import { assetVec } from '@/lib/layers';
 
 export interface OrbitElements {
   id: string;
@@ -26,7 +27,7 @@ const NORTH = new THREE.Vector3(0, 1, 0);
 
 /** Build a great-circle orbit that passes through the asset's nominal position. */
 function elementsFor(asset: Asset, index: number): OrbitElements {
-  const base = new THREE.Vector3(...geoToVec(asset.lat, asset.lon, asset.altKm));
+  const base = new THREE.Vector3(...assetVec(asset));
   const radius = base.length();
   const e1 = base.clone().normalize();
 
@@ -84,7 +85,7 @@ export function orbitTangent(el: OrbitElements, t: number, out = new THREE.Vecto
 
 /** Static scene position for anything that does not orbit. */
 export function staticPosition(asset: Asset) {
-  return new THREE.Vector3(...geoToVec(asset.lat, asset.lon, asset.altKm));
+  return new THREE.Vector3(...assetVec(asset));
 }
 
 /**
@@ -101,7 +102,7 @@ export function windowScore(sat: THREE.Vector3, receiver: THREE.Vector3) {
   const elDeg = THREE.MathUtils.radToDeg(elevation);
   // usable above ~18 deg elevation, best overhead
   const el = THREE.MathUtils.smoothstep(elDeg, 18, 55);
-  const rangeFactor = THREE.MathUtils.clamp(1 - (range - 0.12) / 0.75, 0, 1);
+  const rangeFactor = THREE.MathUtils.clamp(1 - (range - 0.2) / 1.1, 0, 1);
   return el * (0.35 + 0.65 * rangeFactor);
 }
 
